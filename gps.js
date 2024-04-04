@@ -297,6 +297,50 @@
   }
 
   /**
+   * 
+   * @param {string} str 
+   * @returns {string}
+   */
+  function escapeString(str){
+    const invalidCharacters = [
+        "\r",
+        "\n",
+        "$",
+        "*",
+        ",",
+        "!",
+        "\\",
+        "~",
+        "\u007F", // DEL HEX 7F
+    ]
+
+    for (const invalidCharacter of invalidCharacters) {
+        if (str.includes(invalidCharacter)) {
+            throw new Error(
+                `Message may not contain invalid Character '${invalidCharacter}'`
+            )
+        }
+    }
+
+    if (str.replaceAll(/\^([a-zA-Z0-9]{2})/g, "").includes("^")) {
+        throw new Error(
+            `Message may not contain invalid Character '^' without escape Sequence after it`
+        )
+    }
+
+
+    // this is using an replacement function as second parameter:
+    // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/replace#specifying_a_function_as_the_replacement
+    return str.replaceAll(
+        /\^([a-zA-Z0-9]{2})/g,
+        (fullMatch, escapeSequence) => {
+            return String.fromCharCode(parseInt(escapeSequence, 16))
+        }
+    )
+  }
+
+
+  /**
    *
    * @constructor
    */
@@ -307,7 +351,7 @@
     }
 
     this['events'] = {};
-    this['state'] = { 'errors': 0, 'processed': 0 };
+    this['state'] = { 'errors': 0, 'processed': 0, 'errorDescriptions': [], 'txtBuffer': {} };
   }
 
   GPS.prototype['events'] = null;
@@ -405,6 +449,134 @@
         'systemId': gsa.length > 19 ? parseNumber(gsa[18]) : null
       };
     },
+      // Text Transmission
+      // according to https://www.plaisance-pratique.com/IMG/pdf/NMEA0183-2.pdf
+      'TXT': function(str, txt, gps) {
+        if (txt.length !== 6) {
+            throw new Error("Invalid TXT length: " + str)
+        }
+
+        /*
+         eg1. $GNTXT,01,01,02,GPS;GLO;GAL;BDS*77
+         eg2. $GNTXT,01,01,02,SBAS;IMES;QZSS*49
+         
+         
+         1= Total number of sentences, 01 to 99
+         2= Sentence number, 01 to 99
+         3= Text identifier, 01 to 99
+         4= Text message (with ^ escapes, see below)
+         5= Checksum
+         */
+
+        if (txt[1].length !== 2) {
+            throw new Error("Invalid TXT Number of sequences Length: " + txt[1])
+        }
+
+        const sequenceLength = parseInt(txt[1], 10)
+
+        if (txt[2].length !== 2) {
+            throw new Error("Invalid TXT Sentence number Length: " + txt[2])
+        }
+
+        const sentenceNumber = parseInt(txt[2], 10)
+
+        if (txt[3].length !== 2) {
+            throw new Error("Invalid TXT Text identifier Length: " + txt[3])
+        }
+
+        //this is used to identify the multiple sentence messages, it doesn't mean anything, when there is only one sentence
+        const textIdentifier = `identifier_${parseInt(txt[3], 10)}`
+
+        if (txt[4].length > 61) {
+            throw new Error("Invalid TXT Message Length: " + txt[4])
+        }
+
+        const message = escapeString(txt[4])
+
+        if (message === "") {
+            throw new Error("Invalid empty TXT message: " + message)
+        }
+
+        // this tries to parse a sentence that is more than one message, it doesn'T assume, that all sentences arrive in order, but it has a timeout for receiving all!
+        if (sequenceLength != 1) {
+          if(gps === undefined){
+            throw new Error(`Can't parse multi sequence with the static function, it can't store partial messages!`)
+          }
+            if (gps["state"]["txtBuffer"][textIdentifier] === undefined) {
+                // the map is necessary, otherwise the values in there refer all to the same value, and if you change one, you change all
+                gps["state"]["txtBuffer"][textIdentifier] = new Array(
+                    sequenceLength + 1
+                ).map((_, i) => {
+                    if (i === sequenceLength) {
+                        const SECONDS = 20 // 20 seconds is the arbitrary timeout
+
+                        // the timeout ID is stored in that array, it gets cancelled, when all sentences arrived, otherwise it fires and sets an error!
+                        return setTimeout(
+                            (_identifier, _SECONDS, _gps) => {
+                                const errorMessage = `The multi sentence messsage with the identifier ${_identifier} timed out while waiting fro all pieces of the sentence for ${_SECONDS} seconds`
+                                _gps["state"]["errors"]++
+                                _gps["state"]["errorDescriptions"].push(
+                                    errorMessage
+                                )
+
+                                _gps["emit"]("data", null)
+                                _gps["emit"]("error", errorMessage)
+                            },
+                            SECONDS * 1000,
+                            textIdentifier,
+                            SECONDS,
+                            gps
+                        ) 
+                    }
+                    return ""
+                })
+            }
+
+            gps["state"]["txtBuffer"][textIdentifier][sentenceNumber - 1] = message;
+
+            const receivedMessages = gps["state"]["txtBuffer"][textIdentifier].reduce(
+                (acc, elem, i) => {
+                    if (i === sequenceLength) {
+                        return acc
+                    }
+                    return acc + (elem === "" ? 0 : 1)
+                },
+                0
+            )
+
+            if (receivedMessages === sequenceLength) {
+                const rawMessages = gps["state"]["txtBuffer"][textIdentifier].filter(
+                    (_, i) => i !== sequenceLength
+                )
+
+                const timerID = gps["state"]["txtBuffer"][textIdentifier][sequenceLength]
+                clearTimeout(timerID)
+
+                gps["state"]["txtBuffer"][textIdentifier] = undefined
+
+                return {
+                    message: rawMessages.join(""),
+                    completed: true,
+                    rawMessages: rawMessages,
+                    sentenceAmount: sequenceLength,
+                }
+            } else {
+                return {
+                    message: null,
+                    completed: false,
+                    rawMessages: [],
+                    sentenceAmount: sequenceLength,
+                }
+            }
+        }
+
+        return {
+            message: message,
+            completed: true,
+            rawMessages: [message],
+            sentenceAmount: sequenceLength,
+        }
+      },
     // Recommended Minimum data for gps
     'RMC': function(str, rmc) {
 
@@ -735,18 +907,37 @@
     }
   };
 
-  GPS['Parse'] = function(line) {
+  GPS['Parse'] = function(line, gps) {
 
     if (typeof line !== 'string')
-      return false;
+      return [false, "Input was not a string"]
 
     var nmea = line.split(',');
 
     var last = nmea.pop();
 
     // HDT is 2 items length
-    if (nmea.length < 2 || line.charAt(0) !== '$' || last.indexOf('*') === -1) {
-      return false;
+    if (nmea.length < 2) {
+        return [
+            false,
+            `Each NMEA line has to be at least 2 fields, but this line has: ${nmea.length}`,
+        ]
+    }
+
+    if (line.charAt(0) !== "$") {
+        return [
+            false,
+            `Each NMEA line has to beging with $, but this line begins with: '${line.charAt(
+                0
+            )}'`,
+        ]
+    }
+
+    if (last.indexOf("*") === -1) {
+        return [
+            false,
+            `Each NMEA line has to have a checksum, but this line has none: '${line}'`,
+        ]
     }
 
     last = last.split('*');
@@ -758,14 +949,18 @@
 
     if (GPS['mod'][nmea[0]] !== undefined) {
       // set raw data here as well?
-      var data = this['mod'][nmea[0]](line, nmea);
-      data['raw'] = line;
-      data['valid'] = isValid(line, nmea[nmea.length - 1]);
-      data['type'] = nmea[0];
+      try {
+          var data = this["mod"][nmea[0]](line, nmea, gps)
+          data["raw"] = line
+          data["valid"] = isValid(line, nmea[nmea.length - 1])
+          data["type"] = nmea[0]
+      } catch (err) {
+          return [false, `${nmea[0]} parse Error: ${err.message}`]
+      }
 
-      return data;
+      return [data, null];
     }
-    return false;
+    return [false, `Unrecognized type: ${nmea[0]}`]
   };
 
   // Heading (N=0, E=90, S=189, W=270) from point 1 to point 2
@@ -836,12 +1031,14 @@
 
   GPS.prototype['update'] = function(line) {
 
-    var parsed = GPS['Parse'](line);
+    var [parsed, errorDescription] = GPS['Parse'](line, this);
 
     this['state']['processed']++;
 
     if (parsed === false) {
       this['state']['errors']++;
+      this['state']['errorDescriptions'].push(errorDescription);
+      this["emit"]("error", errorDescription)
       return false;
     }
 
